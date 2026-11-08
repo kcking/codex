@@ -227,6 +227,28 @@ fn detects_rex() {
 }
 
 #[test]
+fn detects_rio() {
+    for program in ["rio", "Rio", "RIO"] {
+        let env = FakeEnvironment::new()
+            .with_var("TERM_PROGRAM", program)
+            .with_var("TERM_PROGRAM_VERSION", "0.5.28")
+            .with_var("TERM", "xterm-256color");
+        let terminal = detect_terminal_info_from_env(&env);
+        assert_eq!(
+            terminal,
+            terminal_info(
+                TerminalName::Rio,
+                Some(program),
+                Some("0.5.28"),
+                /*term*/ None,
+                /*multiplexer*/ None,
+            ),
+        );
+        assert_eq!(terminal.user_agent_token(), format!("{program}/0.5.28"));
+    }
+}
+
+#[test]
 fn detects_vscode() {
     let env = FakeEnvironment::new()
         .with_var("TERM_PROGRAM", "vscode")

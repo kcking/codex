@@ -185,7 +185,11 @@ fn is_iterm2_terminal(info: &TerminalInfo) -> bool {
 fn supports_kitty_graphics(info: &TerminalInfo) -> bool {
     matches!(
         info.name,
-        TerminalName::Ghostty | TerminalName::Kitty | TerminalName::Rex | TerminalName::WezTerm
+        TerminalName::Ghostty
+            | TerminalName::Kitty
+            | TerminalName::Rex
+            | TerminalName::Rio
+            | TerminalName::WezTerm
     ) || terminal_field_contains(info.term.as_deref(), "kitty")
         || terminal_field_contains(info.term.as_deref(), "ghostty")
         || terminal_field_contains(info.term.as_deref(), "wezterm")
@@ -593,6 +597,41 @@ mod tests {
             assert_eq!(
                 pet_image_support_for_terminal(&info),
                 PetImageSupport::Supported(ImageProtocol::Kitty)
+            );
+        }
+    }
+
+    #[test]
+    fn pet_image_support_detects_rio() {
+        let info = terminal_info_with_version_for_test(
+            TerminalName::Rio,
+            /*multiplexer*/ None,
+            Some("rio"),
+            Some("0.5.28"),
+            Some("xterm-256color"),
+        );
+        assert_eq!(
+            pet_image_support_for_terminal(&info),
+            PetImageSupport::Supported(ImageProtocol::Kitty)
+        );
+
+        for (multiplexer, reason) in [
+            (
+                Multiplexer::Tmux { version: None },
+                PetImageUnsupportedReason::Tmux,
+            ),
+            (
+                Multiplexer::Zellij { version: None },
+                PetImageUnsupportedReason::Zellij,
+            ),
+        ] {
+            let info = TerminalInfo {
+                multiplexer: Some(multiplexer),
+                ..info.clone()
+            };
+            assert_eq!(
+                pet_image_support_for_terminal(&info),
+                PetImageSupport::Unsupported(reason)
             );
         }
     }

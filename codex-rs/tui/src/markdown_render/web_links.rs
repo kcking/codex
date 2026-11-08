@@ -84,6 +84,7 @@ impl WebLinkDisplay {
             TerminalName::AppleTerminal
             | TerminalName::WarpTerminal
             | TerminalName::Dumb
+            | TerminalName::Rio
             | TerminalName::Unknown => Self::WithDestination,
         }
     }
