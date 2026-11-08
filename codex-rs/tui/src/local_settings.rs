@@ -270,6 +270,7 @@ impl LocalSettings {
                         | TerminalName::WarpTerminal
                         | TerminalName::WezTerm
                         | TerminalName::Rex
+                        | TerminalName::Rio
                         | TerminalName::Alacritty
                         | TerminalName::Konsole
                         | TerminalName::GnomeTerminal
