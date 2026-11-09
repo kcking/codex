@@ -1,0 +1,15 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+codex_rust_crate(
+    name = "crossterm",
+    compile_data = ["README.md"],
+    crate_edition = "2024",
+    crate_features = [
+        "bracketed-paste",
+        "derive-more",
+        "event-stream",
+        "events",
+        "windows",
+    ],
+    crate_name = "crossterm",
+)
