@@ -19,8 +19,12 @@ use crossterm::Command;
 use crossterm::SynchronizedUpdate;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
+#[cfg(unix)]
+use crossterm::event::DisableColorSchemeChange;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
+#[cfg(unix)]
+use crossterm::event::EnableColorSchemeChange;
 #[cfg(not(windows))]
 use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyEvent;
@@ -63,6 +67,8 @@ use codex_config::types::NotificationCondition;
 use codex_config::types::NotificationMethod;
 
 mod alternate_screen;
+#[cfg(all(test, unix))]
+mod color_refresh_tests;
 mod event_stream;
 mod frame_rate_limiter;
 mod frame_requester;
@@ -268,6 +274,8 @@ fn set_modes() -> Result<tmux::Options> {
 
     #[cfg(not(windows))]
     let _ = execute!(stdout(), EnableFocusChange);
+    #[cfg(unix)]
+    let _ = execute!(stdout(), EnableColorSchemeChange);
     #[cfg(windows)]
     let _ = execute!(stdout(), DisableFocusChange);
     Ok(options)
@@ -358,6 +366,8 @@ fn restore_common(
     if let Err(err) = execute!(stdout(), DisableBracketedPaste) {
         first_error.get_or_insert(err);
     }
+    #[cfg(unix)]
+    let _ = execute!(stdout(), DisableColorSchemeChange);
     let _ = execute!(stdout(), DisableFocusChange);
     if raw_mode_restore == RawModeRestore::DrainAndDisable {
         #[cfg(unix)]

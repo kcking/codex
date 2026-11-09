@@ -223,8 +223,17 @@ mod imp {
 
     #[cfg(any(unix, windows))]
     pub(super) fn set_default_colors_from_startup_probe(
-        _colors: Option<crate::terminal_probe::DefaultColors>,
+        colors: Option<crate::terminal_probe::DefaultColors>,
     ) {
+        #[cfg(test)]
+        super::TEST_DEFAULT_COLORS.with(|override_colors| {
+            if override_colors.get().is_some() {
+                override_colors.set(Some(colors.map(|colors| DefaultColors {
+                    fg: colors.fg,
+                    bg: colors.bg,
+                })));
+            }
+        });
     }
 }
 

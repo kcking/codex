@@ -1,15 +1,15 @@
-//! Short, best-effort terminal response probes for TUI startup, resume, and exit.
+//! Short, best-effort terminal response probes for startup, runtime refreshes, and exit.
 //!
 //! Crossterm's public helpers wait up to two seconds for terminal responses. That is too long for
 //! TUI startup and resume, where unsupported terminals should simply fall back to conservative
 //! defaults.
 //! This module sends the same kinds of optional terminal queries with a caller-provided deadline,
-//! prefers duplicated stdio handles, falls back to the controlling terminal path when stdio is
+//! prefers borrowed stdio handles, falls back to the controlling terminal path when stdio is
 //! unavailable, and reports `None` when a response is unavailable.
 //!
 //! Probes run only while the crossterm event stream is absent or paused. Startup replays consumed
 //! terminal bytes through crossterm's parser so interleaved user input remains available after the
-//! probe completes.
+//! probe completes. Runtime color refreshes preserve input in the same way.
 
 use std::time::Duration;
 
@@ -45,9 +45,9 @@ mod imp {
     use std::fs::File;
     use std::fs::OpenOptions;
     use std::io;
+    use std::io::IsTerminal;
     use std::io::Write;
     use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -81,67 +81,31 @@ mod imp {
 
     /// Temporary terminal handle used while a probe owns terminal input.
     ///
-    /// The preferred path is duplicated stdin/stdout, because terminal replies are delivered to the
-    /// same input stream crossterm reads from. Some embedded or redirected environments expose a
-    /// controlling terminal without terminal stdio; in that case the handle falls back to
-    /// `/dev/tty`. Only the reader is switched to nonblocking mode, and its original file status
-    /// flags are restored when the handle is dropped.
+    /// Borrow terminal stdio so closing a duplicated descriptor cannot remove Crossterm's
+    /// kqueue registration on macOS. Redirected environments fall back to owned `/dev/tty`
+    /// handles. The reader's original file status flags are restored when the probe ends.
     struct Tty {
-        reader: File,
-        writer: File,
+        reader: Option<File>,
+        writer: Option<File>,
         original_flags: libc::c_int,
     }
 
     impl Tty {
-        /// Opens an isolated reader and writer for terminal probes.
-        ///
-        /// The reader and writer must be separate file descriptions so switching the reader into
-        /// nonblocking mode does not also make writes fail with `WouldBlock` under terminal
-        /// backpressure. Falling back to `/dev/tty` keeps embedded or redirected environments
-        /// usable when they still expose a controlling terminal.
         fn open() -> io::Result<Self> {
-            let stdio_reader = dup_file(libc::STDIN_FILENO);
-            let stdio_writer = dup_file(libc::STDOUT_FILENO);
-            match (stdio_reader, stdio_writer) {
-                (Ok(reader), Ok(writer)) => Self::new(reader, writer),
-                (reader, writer) => {
-                    let stdio_err = match (reader.err(), writer.err()) {
-                        (Some(reader_err), Some(writer_err)) => {
-                            format!("reader: {reader_err}; writer: {writer_err}")
-                        }
-                        (Some(reader_err), None) => format!("reader: {reader_err}"),
-                        (None, Some(writer_err)) => format!("writer: {writer_err}"),
-                        (None, None) => "unknown stdio duplicate error".to_string(),
-                    };
-                    let reader =
-                        OpenOptions::new()
-                            .read(true)
-                            .open("/dev/tty")
-                            .map_err(|fallback_err| {
-                                io::Error::new(
-                                    fallback_err.kind(),
-                                    format!(
-                                        "failed to duplicate stdio ({stdio_err}) or open /dev/tty reader ({fallback_err})"
-                                    ),
-                                )
-                            })?;
-                    let writer = OpenOptions::new().write(true).open("/dev/tty").map_err(
-                        |fallback_err| {
-                            io::Error::new(
-                                fallback_err.kind(),
-                                format!(
-                                    "failed to duplicate stdio ({stdio_err}) or open /dev/tty writer ({fallback_err})"
-                                ),
-                            )
-                        },
-                    )?;
-                    Self::new(reader, writer)
-                }
+            if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                Self::new(None, None)
+            } else {
+                Self::new(
+                    Some(OpenOptions::new().read(true).open("/dev/tty")?),
+                    Some(OpenOptions::new().write(true).open("/dev/tty")?),
+                )
             }
         }
 
-        fn new(reader: File, writer: File) -> io::Result<Self> {
-            let fd = reader.as_raw_fd();
+        fn new(reader: Option<File>, writer: Option<File>) -> io::Result<Self> {
+            let fd = reader
+                .as_ref()
+                .map_or(libc::STDIN_FILENO, AsRawFd::as_raw_fd);
             let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if original_flags == -1 {
                 return Err(io::Error::last_os_error());
@@ -156,9 +120,21 @@ mod imp {
             })
         }
 
+        fn reader_fd(&self) -> libc::c_int {
+            self.reader
+                .as_ref()
+                .map_or(libc::STDIN_FILENO, AsRawFd::as_raw_fd)
+        }
+
         fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.writer.write_all(bytes)?;
-            self.writer.flush()
+            if let Some(writer) = self.writer.as_mut() {
+                writer.write_all(bytes)?;
+                writer.flush()
+            } else {
+                let mut writer = io::stdout().lock();
+                writer.write_all(bytes)?;
+                writer.flush()
+            }
         }
 
         fn read_available(
@@ -176,7 +152,7 @@ mod imp {
                 let bytes_to_read = chunk.len().min(max_bytes.saturating_sub(buffer.len()));
                 let count = unsafe {
                     libc::read(
-                        self.reader.as_raw_fd(),
+                        self.reader_fd(),
                         chunk.as_mut_ptr().cast::<libc::c_void>(),
                         bytes_to_read,
                     )
@@ -201,7 +177,7 @@ mod imp {
 
         fn poll_readable(&self, timeout: Duration) -> io::Result<bool> {
             let mut fd = libc::pollfd {
-                fd: self.reader.as_raw_fd(),
+                fd: self.reader_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
@@ -234,18 +210,8 @@ mod imp {
 
     impl Drop for Tty {
         fn drop(&mut self) {
-            let _ =
-                unsafe { libc::fcntl(self.reader.as_raw_fd(), libc::F_SETFL, self.original_flags) };
+            let _ = unsafe { libc::fcntl(self.reader_fd(), libc::F_SETFL, self.original_flags) };
         }
-    }
-
-    /// Duplicates a process stdio descriptor so probe cleanup owns only the duplicate.
-    fn dup_file(fd: libc::c_int) -> io::Result<File> {
-        let duplicated = unsafe { libc::dup(fd) };
-        if duplicated == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { File::from_raw_fd(duplicated) })
     }
 
     /// Queries OSC 10 and OSC 11 default colors under one shared deadline.
@@ -257,7 +223,13 @@ mod imp {
     pub(crate) fn default_colors(timeout: Duration) -> io::Result<Option<DefaultColors>> {
         let mut tty = Tty::open()?;
         tty.write_all(b"\x1B]10;?\x1B\\\x1B]11;?\x1B\\")?;
-        read_until(&mut tty, timeout, |buffer| parse_default_colors(buffer))
+        let mut buffer = Vec::new();
+        let result = read_until_buffered(&mut tty, timeout, &mut buffer, |buffer| {
+            parse_default_colors(buffer)
+        });
+        // Preserve typing, paste, and incomplete sequences even on timeout or read failure.
+        crossterm::event::buffer_input(&startup_replay_input(&buffer))?;
+        result
     }
 
     /// Queries the terminal cursor position while normal input polling is paused.
@@ -337,13 +309,21 @@ mod imp {
     fn read_until<T>(
         tty: &mut Tty,
         timeout: Duration,
+        parse: impl FnMut(&mut Vec<u8>) -> Option<T>,
+    ) -> io::Result<Option<T>> {
+        read_until_buffered(tty, timeout, &mut Vec::new(), parse)
+    }
+
+    fn read_until_buffered<T>(
+        tty: &mut Tty,
+        timeout: Duration,
+        buffer: &mut Vec<u8>,
         mut parse: impl FnMut(&mut Vec<u8>) -> Option<T>,
     ) -> io::Result<Option<T>> {
         let deadline = Instant::now() + timeout;
-        let mut buffer = Vec::new();
         loop {
-            tty.read_available(&mut buffer, deadline, MAX_TERMINAL_PROBE_BYTES)?;
-            if let Some(value) = parse(&mut buffer) {
+            tty.read_available(buffer, deadline, MAX_TERMINAL_PROBE_BYTES)?;
+            if let Some(value) = parse(buffer) {
                 return Ok(Some(value));
             }
             let now = Instant::now();
@@ -585,7 +565,7 @@ mod imp {
 
             let reader: OwnedFd = reader.into();
             let writer: OwnedFd = writer.into();
-            Tty::new(reader.into(), writer.into()).expect("create terminal probe")
+            Tty::new(Some(reader.into()), Some(writer.into())).expect("create terminal probe")
         }
 
         #[test]
@@ -600,7 +580,7 @@ mod imp {
             let mut queued = [0; 12];
             let count = unsafe {
                 libc::read(
-                    tty.reader.as_raw_fd(),
+                    tty.reader_fd(),
                     queued.as_mut_ptr().cast::<libc::c_void>(),
                     queued.len(),
                 )
@@ -627,7 +607,7 @@ mod imp {
                 let mut queued = [0; 224];
                 let count = unsafe {
                     libc::read(
-                        tty.reader.as_raw_fd(),
+                        tty.reader_fd(),
                         queued.as_mut_ptr().cast::<libc::c_void>(),
                         queued.len(),
                     )

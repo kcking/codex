@@ -44,6 +44,9 @@ pub type EventResult = std::io::Result<Event>;
 /// Value in production is [`CrosstermEventSource`].
 pub trait EventSource: Send + 'static {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>>;
+
+    /// Refresh terminal-derived styles without discarding queued input.
+    fn refresh_default_colors(&mut self) {}
 }
 
 /// Shared crossterm input state for all [`TuiEventStream`] instances. A single crossterm EventStream
@@ -127,7 +130,7 @@ impl<S: EventSource + Default> EventBroker<S> {
 /// Real crossterm-backed event source.
 pub struct CrosstermEventSource {
     #[cfg(not(windows))]
-    events: crossterm::event::EventStream,
+    events: Option<crossterm::event::EventStream>,
     #[cfg(windows)]
     events: super::windows_key_sequence::WindowsKeySequence<crossterm::event::EventStream>,
 }
@@ -137,7 +140,7 @@ impl Default for CrosstermEventSource {
         let events = crossterm::event::EventStream::new();
         Self {
             #[cfg(not(windows))]
-            events,
+            events: Some(events),
             #[cfg(windows)]
             events: super::windows_key_sequence::WindowsKeySequence::new(events),
         }
@@ -151,6 +154,14 @@ impl EventSource for CrosstermEventSource {
         #[cfg(windows)]
         let _ = super::windows_console::ensure_input_record_mode();
 
+        #[cfg(not(windows))]
+        let result = Pin::new(
+            self.get_mut()
+                .events
+                .get_or_insert_with(crossterm::event::EventStream::new),
+        )
+        .poll_next(cx);
+        #[cfg(windows)]
         let result = Pin::new(&mut self.get_mut().events).poll_next(cx);
 
         // EventStream starts its blocking reader before returning Pending, so reassert the mode
@@ -161,6 +172,26 @@ impl EventSource for CrosstermEventSource {
         }
 
         result
+    }
+
+    #[cfg(unix)]
+    fn refresh_default_colors(&mut self) {
+        // Unsupported terminals should not pay a probe timeout on every focus report.
+        if crate::terminal_palette::default_colors().is_none() {
+            return;
+        }
+
+        // Drop the reader before probing so it cannot steal OSC replies. The probe replays
+        // unrelated input into crossterm, whose existing queue also survives dropping the stream.
+        drop(self.events.take());
+        match crate::terminal_probe::default_colors(crate::terminal_probe::DEFAULT_TIMEOUT) {
+            Ok(Some(colors)) => {
+                crate::terminal_palette::set_default_colors_from_startup_probe(Some(colors));
+            }
+            Ok(None) => {} // Retain the last successful palette on transient timeouts.
+            Err(err) => tracing::debug!("terminal color refresh failed: {err}"),
+        }
+        self.events = Some(crossterm::event::EventStream::new());
     }
 }
 
@@ -304,15 +335,30 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
-                // Keep the startup-cached palette: querying terminal colors here blocks the
-                // input loop, and a direct probe would discard keys typed during the refresh.
+                self.refresh_default_colors();
                 Some(TuiEvent::FocusGained)
+            }
+            Event::ColorSchemeChanged(_) => {
+                self.refresh_default_colors();
+                Some(TuiEvent::Draw)
             }
             Event::FocusLost => {
                 self.terminal_focused.store(false, Ordering::Relaxed);
                 Some(TuiEvent::FocusLost)
             }
             Event::Mouse(mouse) => Some(TuiEvent::Mouse(mouse)),
+        }
+    }
+
+    fn refresh_default_colors(&self) {
+        if let Some(source) = self
+            .broker
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_event_source_mut()
+        {
+            source.refresh_default_colors();
         }
     }
 }
